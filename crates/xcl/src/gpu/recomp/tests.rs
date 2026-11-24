@@ -6037,6 +6037,137 @@ fn gpu_split_wave64_masks_read_whole_after_partial_writes() {
     }
 }
 
+/// Bit-parallel 64-bit mask chains (`s_and/or/xor/not/mov/andn2_b64`), branchless
+/// `s_and_saveexec_b64` if/else predication, and half-local `v_cmpx_*` stay in their half
+/// (zero exchanges), while cross-half consumers (`s_cbranch_scc0`, `s_cbranch_execz`,
+/// `v_readfirstlane_b32`, `ds_bpermute_b32`) still force the exchange when only the upper half
+/// has active bits (lanes 40..63). Verified on both the HLSL and direct DXIL paths.
+#[test]
+fn gpu_split_wave64_bit_parallel_and_exec_masks() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    // 1) Purely half-local chain in Compute mode (end_reads_all = false):
+    //    bit-parallel masks + branchless saveexec if/else + restored outer EXEC + v_cmpx.
+    //    Writes 4 dwords per lane (lanes 0..63) to flat memory.
+    let local_code = prog(&[
+        // v0 = lane_id (tid.x, 0..63)
+        // vcc = (v0 < 40), s[20:21] = (v0 > 15)
+        ("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None), // dummy overwritten below
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40)), // vcc = 0..39
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 255), ("SRC1", V)], Some(15)), // s[20:21] = 16..63
+        // bit-parallel combinations across both halves:
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 22), ("SSRC0", 106), ("SSRC1", 20)], None), // 16..39
+        ("S_NOT_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 22)], None),                 // 0..15, 40..63
+        ("S_XOR_B64", "ENC_SOP2", &[("SDST", 26), ("SSRC0", 22), ("SSRC1", 20)], None),  // 40..63
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 28), ("SSRC0", 24)], None),                 // 0..15, 40..63
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 129)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", 22)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", 28)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", 26)], None),
+        // branchless if (v0 < 35) v6 = 10 else v6 = 20; restore EXEC; outer s_cbranch_execz
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(35)), // vcc = 0..34
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 16), ("SSRC0", 106)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 138)], None), // 10
+        ("S_ANDN2_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 16), ("SSRC1", 126)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 148)], None), // 20
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 16)], None),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None), // outer EXEC read whole, inner stays local!
+        // pack (v3 | v4<<1 | v5<<2 | v6<<4) into v7, then predicate v7 += 100 via half-local v_cmpx
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 4), ("SRC1", 129), ("SRC2", V + 3)], None),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 5), ("SRC1", 130), ("SRC2", V + 7)], None),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 6), ("SRC1", 132), ("SRC2", V + 7)], None),
+        // store pre-cmpx value to mem[lane], then v_cmpx (v0 >= 21) adds 100 and overwrites mem[lane]
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 0x7D)], None),
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(20)), // active = 21..63
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 7)], Some(100)),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 0x7D)], None),
+    ]);
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let opt = on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64: true, ..Default::default() });
+    let t = translate(&local_code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    if runner::split_wave64() {
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0, "all masks stay half-local:\n{}", t.hlsl);
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 5);
+    }
+    let hlsl_dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let ko = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
+    let direct_dxil = crate::gpu::dxil::kernel::translate_compute(&local_code, ko, &cs).unwrap().dxil;
+    for (label, dxil) in [("hlsl", &hlsl_dxil), ("direct", &direct_dxil)] {
+        let out = runner::dispatch(dxil, [1, 1, 1], &vec![0u32; 128], &vec![0u32; 64]).unwrap();
+        for l in 0..64u32 {
+            let b3 = u32::from((16..40).contains(&l));
+            let b4 = u32::from(!(16..40).contains(&l));
+            let b5 = u32::from(l >= 40);
+            let b6 = if l < 35 { 10 } else { 20 };
+            let mut want = b3 | (b4 << 1) | (b5 << 2) | (b6 << 4);
+            if l > 20 {
+                want += 100;
+            }
+            assert_eq!(out[l as usize], want, "{label}: lane {l}");
+        }
+    }
+
+    // 2) Cross-half soundness: only upper-half lanes (45..63) match; every whole-wave consumer
+    //    must force an exchange so lower-half lanes (0..31) see the same SCC / EXEC / lane value.
+    let sound_code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None), // s10 = 0
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None), // s12 = 0
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 255)], Some(45 * 4)),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0)], Some(1000)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None),
+        // s[20:21] = (v0 >= 45) -> lo = 0, hi != 0
+        ("V_CMP_LE_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 255), ("SRC1", V)], Some(45)),
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 22), ("SSRC0", 20), ("SSRC1", 20)], None), // sets SCC = 1
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),                         // must NOT skip
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 129)], None),               // s10 = 1 (taken if SCC == 1)
+        // v_cmpx -> only lanes 45..63 active; v_readfirstlane must return 45; s_cbranch_execz must NOT jump
+        ("V_CMPX_LE_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(45)),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V)], None), // s11 = 45
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)], None),                 // must NOT skip
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 130)], None),        // s12 = 2
+        // restore all lanes, then set EXEC = {lane 0, lane 45} via v_cmp + s_or_b64 + s_mov_b64 exec:
+        // lane 0 (in half 0) reads lane 45 (in half 1) via ds_bpermute_b32; without the exchange
+        // half 0 would see exec_hi == 0 and return 0 instead of 1045.
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None), // exec = all 1s
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None), // vcc = {0}
+        ("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 24), ("SRC0", 255), ("SRC1", V)], Some(45)), // s[24:25] = {45}
+        ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 106), ("SSRC1", 24)], None), // exec = {0, 45}
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 1), ("DATA0", 2)], None),  // lanes 0 & 45 get 1045
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 10)], None), // s10
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 11)], None), // s11
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 12)], None), // s12
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", V + 7), ("VSRC1", 5)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", V + 7), ("VSRC1", 6)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 0x7D)], None),
+    ]);
+    let ts = translate(&sound_code, &opt).unwrap();
+    assert!(ts.complete(), "{:?}", ts.unsupported_why);
+    if runner::split_wave64() {
+        assert_eq!(ts.hlsl.matches("= xcl_x_ballot(and(").count(), 4, "every cross-half consumer exchanges:\n{}", ts.hlsl);
+    }
+    let hlsl_s = dxc::compile(&ts.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let direct_s = crate::gpu::dxil::kernel::translate_compute(&sound_code, ko, &cs).unwrap().dxil;
+    for (label, dxil) in [("hlsl", &hlsl_s), ("direct", &direct_s)] {
+        let out = runner::dispatch(dxil, [1, 1, 1], &vec![0u32; 128], &vec![0u32; 64]).unwrap();
+        for l in 0..64u32 {
+            // s10=1, s11=45, s12=2; v6 = 1045 on lanes 0 and 45, 0 on all other lanes
+            let want = 1 + 45 + 2 + if l == 0 || l == 45 { 1045 } else { 0 };
+            assert_eq!(out[l as usize], want, "{label}: soundness lane {l}");
+        }
+    }
+}
+
 /// Four wave64s per group whose waves loop a different number of times (the counter-paired
 /// form on 32-lane GPUs): each iteration a mask read lane by lane (`v_cndmask`) that only the
 /// odd waves also read whole (`s_bcnt1`, on their own path), and a 64-bit carry chain (not
